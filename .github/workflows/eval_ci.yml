@@ -1,0 +1,198 @@
+name: Legal RAG Eval CI
+
+on:
+  # Manual trigger from the eval repo
+  workflow_dispatch:
+    inputs:
+      rag_url:
+        description: "RAG base URL to evaluate against"
+        required: false
+        default: "http://localhost:8000"
+      report_name:
+        description: "Report name prefix (e.g. 'baseline', 'after_cfr')"
+        required: false
+        default: "ci_run"
+
+  schedule:
+    - cron: '0 2 * * *'   # nightly at 2am UTC
+
+  # Cross-repo trigger: legal-rag pushes to main fire this via repository_dispatch
+  # In legal-rag's CI, add a step that calls:
+  #   curl -X POST https://api.github.com/repos/OWNER/legal-rag-eval/dispatches \
+  #     -H "Authorization: token ${{ secrets.EVAL_REPO_PAT }}" \
+  #     -d '{"event_type":"legal-rag-push","client_payload":{"sha":"${{ github.sha }}"}}'
+  repository_dispatch:
+    types: [legal-rag-push]
+
+env:
+  RAG_BASE_URL: ${{ github.event.inputs.rag_url || 'http://localhost:8000' }}
+  REPORT_NAME: ${{ github.event.inputs.report_name || 'ci_run' }}
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1: Spin up the legal RAG stack
+  # ---------------------------------------------------------------------------
+  start-rag:
+    name: Start Legal RAG Stack
+    runs-on: ubuntu-latest
+    outputs:
+      rag_ready: ${{ steps.health.outputs.rag_ready }}
+
+    steps:
+      - name: Checkout legal-rag repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.LEGAL_RAG_REPO || github.repository_owner }}/legal-rag
+          # Use a PAT if the legal-rag repo is private
+          token: ${{ secrets.EVAL_REPO_PAT || github.token }}
+          path: legal-rag
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Start infrastructure (Qdrant, Postgres, Redis)
+        working-directory: legal-rag/infra
+        run: |
+          docker compose up -d postgres qdrant redis
+          echo "Waiting for infrastructure to be healthy..."
+          sleep 15
+
+      - name: Start backend
+        working-directory: legal-rag/infra
+        run: |
+          docker compose --profile backend up -d backend
+          echo "Waiting for backend to start..."
+          sleep 20
+
+      - name: Health check RAG endpoint
+        id: health
+        run: |
+          echo "Polling RAG health endpoint..."
+          for i in $(seq 1 12); do
+            status=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/api/v1/health || echo "000")
+            if [ "$status" = "200" ]; then
+              echo "✅ RAG is healthy (attempt $i)"
+              echo "rag_ready=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "⏳ Attempt $i/12 — status=$status, waiting 10s..."
+            sleep 10
+          done
+          echo "❌ RAG health check failed after 120s"
+          echo "rag_ready=false" >> $GITHUB_OUTPUT
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Run the eval harness
+  # ---------------------------------------------------------------------------
+  run-eval:
+    name: Run Eval Harness
+    runs-on: ubuntu-latest
+    needs: start-rag
+    if: needs.start-rag.outputs.rag_ready == 'true'
+
+    steps:
+      - name: Checkout eval repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run eval harness
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          RAG_BASE_URL: ${{ env.RAG_BASE_URL }}
+          SKIP_LLM_METRICS: ${{ secrets.OPENAI_API_KEY == '' && 'true' || 'false' }}
+        run: |
+          python runner.py \
+            --base-url "$RAG_BASE_URL" \
+            --report "$REPORT_NAME"
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report-${{ env.REPORT_NAME }}
+          path: reports/${{ env.REPORT_NAME }}_report.json
+          retention-days: 90
+
+      - name: Parse report for PR comment
+        id: parse_report
+        if: always()
+        run: |
+          python - <<'EOF'
+          import json, os, pathlib
+
+          report_path = pathlib.Path(f"reports/{os.environ['REPORT_NAME']}_report.json")
+          if not report_path.exists():
+              print("Report not found — cannot parse")
+              exit(0)
+
+          with open(report_path) as f:
+              report = json.load(f)
+
+          summary = report.get("summary", {})
+          ci = report.get("ci", {})
+          agg = summary.get("aggregate", {})
+
+          ci_icon = "✅" if ci.get("passed") else "❌"
+          lines = [
+              f"## {ci_icon} Legal RAG Eval Results",
+              "",
+              f"| Metric | Score | Threshold | Status |",
+              f"|--------|-------|-----------|--------|",
+              f"| Citation Accuracy | {agg.get('citation_accuracy', 'N/A'):.3f} | ≥ {ci['thresholds']['citation_min']} | {'✅' if agg.get('citation_accuracy', 0) >= ci['thresholds']['citation_min'] else '❌'} |",
+              f"| Hallucination Rate | {agg.get('hallucination_rate', 'N/A'):.3f} | ≤ {ci['thresholds']['hallucination_max']} | {'✅' if agg.get('hallucination_rate', 1) <= ci['thresholds']['hallucination_max'] else '❌'} |",
+              f"| Answer Relevancy | {agg.get('answer_relevancy', 'N/A'):.3f} | ≥ {ci['thresholds']['relevancy_min']} | {'✅' if agg.get('answer_relevancy', 0) >= ci['thresholds']['relevancy_min'] else '❌'} |",
+              "",
+              f"**Questions evaluated:** {summary.get('total_questions', 0)}",
+              f"**Errors:** {summary.get('errored', 0)}",
+          ]
+
+          if ci.get("breaches"):
+              lines += ["", "**Threshold breaches:**"]
+              for breach in ci["breaches"]:
+                  lines.append(f"- {breach}")
+
+          # Write to GitHub env for next step
+          comment_body = "\\n".join(lines)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"PR_COMMENT<<EOF\n{comment_body}\nEOF\n")
+
+          EOF
+
+      - name: Post PR comment with eval scores
+        uses: marocchino/sticky-pull-request-comment@v2
+        if: github.event_name == 'pull_request' && always()
+        with:
+          header: legal-rag-eval
+          message: ${{ env.PR_COMMENT }}
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Teardown
+  # ---------------------------------------------------------------------------
+  teardown:
+    name: Teardown RAG Stack
+    runs-on: ubuntu-latest
+    needs: [start-rag, run-eval]
+    if: always()
+
+    steps:
+      - name: Checkout legal-rag repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.LEGAL_RAG_REPO || github.repository_owner }}/legal-rag
+          token: ${{ secrets.EVAL_REPO_PAT || github.token }}
+          path: legal-rag
+
+      - name: Stop all services
+        working-directory: legal-rag/infra
+        run: docker compose --profile backend down -v
+        continue-on-error: true

@@ -1,0 +1,19 @@
+# Environment
+.env
+.env.local
+
+# Reports (generated, not source)
+reports/*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# OS
+.DS_Store
+
+# DeepEval
+.deepeval
