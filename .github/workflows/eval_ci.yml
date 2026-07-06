@@ -43,10 +43,10 @@ jobs:
 
       - name: Wait for deployed RAG
         run: |
-          echo "Checking $RAG_BASE_URL/api/v1/health"
+          echo "Checking $RAG_BASE_URL/health"
           for i in $(seq 1 30); do
             status=$(curl --max-time 30 -sS -o health.json -w "%{http_code}" \
-              "$RAG_BASE_URL/api/v1/health" || true)
+              "$RAG_BASE_URL/health" || true)
             if [ "$status" = "200" ]; then
               cat health.json
               echo "RAG is healthy (attempt $i)"

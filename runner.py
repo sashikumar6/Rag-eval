@@ -54,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 def call_chat_endpoint(
     question: str,
-    base_url: str = cfg.CHAT_ENDPOINT,
+    base_url: Optional[str] = None,
     timeout: float = cfg.HTTP_TIMEOUT,
     retries: int = cfg.HTTP_MAX_RETRIES,
 ) -> Optional[dict]:
@@ -69,6 +69,7 @@ def call_chat_endpoint(
 
     Returns the parsed JSON response dict, or None on failure.
     """
+    endpoint = base_url or cfg.CHAT_ENDPOINT
     payload = {
         "query": question,
         "mode": "auto",
@@ -77,7 +78,7 @@ def call_chat_endpoint(
     for attempt in range(retries + 1):
         try:
             with httpx.Client(timeout=timeout) as client:
-                response = client.post(base_url, json=payload)
+                response = client.post(endpoint, json=payload)
                 response.raise_for_status()
                 return response.json()
         except httpx.TimeoutException:
@@ -596,10 +597,10 @@ def main() -> int:
 
     # --------------- Health check ---------------
     if not args.dry_run:
-        logger.info(f"Checking RAG health at {cfg.RAG_BASE_URL}/api/v1/health ...")
+        logger.info(f"Checking RAG health at {cfg.RAG_BASE_URL}/health ...")
         try:
             with httpx.Client(timeout=10.0) as client:
-                resp = client.get(f"{cfg.RAG_BASE_URL}/api/v1/health")
+                resp = client.get(f"{cfg.RAG_BASE_URL}/health")
                 if resp.status_code == 200:
                     logger.info("✅ RAG is healthy")
                 else:
