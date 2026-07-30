@@ -12,8 +12,9 @@ on:
         required: false
         default: "ci_run"
 
-  schedule:
-    - cron: "0 2 * * *"
+  # Nightly eval disabled to prevent automatic OpenAI token spend.
+  # schedule:
+  #   - cron: "0 2 * * *"
 
   repository_dispatch:
     types: [legal-rag-push]
